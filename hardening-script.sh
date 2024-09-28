@@ -6,26 +6,115 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# Function to add sysctl lines to a file
-add_sysctl_lines() {
-  local file="$1"
-  local lines_to_add="$2"
-
-  if [ -f "$file" ]; then
-    # Check if each line exists and uncommented in the file
-    for line in $lines_to_add; do
-      if ! grep -q "^\s*#*${line}" "$file"; then
-        echo "$line" >> "$file"
-        added_lines="$added_lines\n$line"
-      fi
-    done
+# Function to detect package manager and set commands
+detect_package_manager() {
+  if [ -f /etc/debian_version ]; then
+    PM_INSTALL="apt-get install -y"
+    PM_REMOVE="apt-get purge -y"
+    PM_LIST="dpkg -l"
+  elif [ -f /etc/redhat-release ]; then
+    PM_INSTALL="dnf install -y"
+    PM_REMOVE="dnf remove -y"
+    PM_LIST="rpm -qa"
+  elif [ -f /etc/arch-release ]; then
+    PM_INSTALL="pacman -S --noconfirm"
+    PM_REMOVE="pacman -Rns --noconfirm"
+    PM_LIST="pacman -Qq"
   else
-    echo "File $file not found."
+    echo "Unsupported Linux distribution. Please install packages manually."
+    exit 1
   fi
 }
 
+# Function to add sysctl lines
+add_sysctl_lines() {
+  local file="$1"
+  local lines="$2"
+  local added_lines=""
+
+  if [ -f "$file" ]; then
+    while IFS= read -r line; do
+      line=$(echo "$line" | sed 's/^\s*#\s*//')  # Remove leading '#' and whitespace
+      if ! grep -Eq "^\s*${line//./\\.}" "$file"; then
+        echo "$line" >> "$file"
+        added_lines="${added_lines}\n$line"
+      fi
+    done <<< "$lines"
+  else
+    echo "File $file not found."
+  fi
+
+  echo -e "$added_lines"
+}
+
+# Function to configure UFW
+configure_ufw() {
+  echo "Configuring the firewall..."
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow ssh
+  ufw allow http
+  ufw allow https
+  ufw --force enable
+}
+
+# Function to remove CUPS packages
+remove_cups_packages() {
+  echo "Removing CUPS packages..."
+  local cups_packages
+  local package_count=0
+
+  case "$PM_REMOVE" in
+    *apt-get*)
+      cups_packages=$(dpkg -l | grep 'cups' | awk '{print $2}')
+      if [ -n "$cups_packages" ]; then
+        package_count=$(echo "$cups_packages" | wc -l)
+        apt-get purge -y $cups_packages >/dev/null 2>&1
+      fi
+      ;;
+    *dnf*)
+      cups_packages=$(dnf list installed | grep 'cups' | awk '{print $1}')
+      if [ -n "$cups_packages" ]; then
+        package_count=$(echo "$cups_packages" | wc -l)
+        dnf remove -y $cups_packages >/dev/null 2>&1
+      fi
+      ;;
+    *pacman*)
+      cups_packages=$(pacman -Qq | grep 'cups')
+      if [ -n "$cups_packages" ]; then
+        package_count=$(echo "$cups_packages" | wc -l)
+        pacman -Rns --noconfirm $cups_packages >/dev/null 2>&1
+      fi
+      ;;
+    *)
+      echo "Package manager not supported for removing CUPS."
+      ;;
+  esac
+
+  systemctl stop cups.service cups-browsed.service 2>/dev/null
+  systemctl disable cups.service cups-browsed.service 2>/dev/null
+
+  if [ "$package_count" -gt 0 ]; then
+    echo "Removed $package_count CUPS packages and disabled CUPS services."
+  else
+    echo "No CUPS packages were found to remove."
+  fi
+}
+
+# Function to disable Bluetooth services
+disable_bluetooth() {
+  echo "Disabling Bluetooth services..."
+  systemctl stop bluetooth.service 2>/dev/null
+  systemctl disable bluetooth.service 2>/dev/null
+  echo "Bluetooth services have been disabled."
+}
+
+# Main script execution starts here
+detect_package_manager
+
 # Lines to add to sysctl configuration
-lines_to_add="#kernel security
+sysctl_lines="
+# Kernel security
 kernel.kptr_restrict=2
 kernel.dmesg_restrict=1
 kernel.printk=3 3 3 3
@@ -36,7 +125,7 @@ vm.unprivileged_userfaultfd=0
 kernel.kexec_load_disabled=1
 kernel.sysrq=4
 
-#network security
+# Network security
 net.ipv4.tcp_syncookies=1
 net.ipv4.tcp_rfc1337=1
 net.ipv4.conf.all.rp_filter=1
@@ -56,60 +145,33 @@ net.ipv4.tcp_sack=0
 net.ipv4.tcp_dsack=0
 net.ipv4.tcp_fack=0
 
-#userspace security
+# Userspace security
 kernel.yama.ptrace_scope=2
 fs.protected_fifos=2
-fs.protected_regular=2"
+fs.protected_regular=2
+"
 
-# Check for /etc/sysctl.conf and add lines
-added_lines=""
-add_sysctl_lines "/etc/sysctl.conf" "$lines_to_add"
-
-# Check for /etc/sysctl.d and add lines
-if [ -d "/etc/sysctl.d" ]; then
-  for file in "/etc/sysctl.d/*"; do
-    add_sysctl_lines "$file" "$lines_to_add"
-  done
-fi
-
-# Print the message
+# Apply sysctl settings
+added_lines=$(add_sysctl_lines "/etc/sysctl.conf" "$sysctl_lines")
 if [ -n "$added_lines" ]; then
-  echo "Added the following lines to sysctl configuration files:"
+  echo "Added the following lines to /etc/sysctl.conf:"
   echo -e "$added_lines"
 else
-  echo "No changes were made to sysctl configuration files."
+  echo "No changes were made to /etc/sysctl.conf."
 fi
 
-#!/bin/bash
-
-# Function to configure UFW
-configure_ufw() {
-  echo "Configuring the firewall..."
-  ufw enable
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw allow ssh
-  ufw allow http
-  ufw allow https
-}
+# Reload sysctl settings
+sysctl -p >/dev/null 2>&1
 
 # Prompt the user for UFW configuration
 while true; do
-  read -p "Do you want to install and configure UFW (Uncomplicated Firewall)? Say no if this PC needs incoming connections such as VPN, Tor nodes, etc. (yes/no): " answer
+  read -p "Do you want to install and configure UFW (Uncomplicated Firewall)? (yes/no): " answer
   case $answer in
     [Yy]*)
       # Install UFW if it's not already installed
-      if ! command -v ufw &> /dev/null; then
+      if ! command -v ufw &>/dev/null; then
         echo "Installing UFW..."
-        if [ -f /etc/debian_version ]; then
-          apt-get install -y ufw
-        elif [ -f /etc/redhat-release ]; then
-          dnf install -y ufw
-        elif [ -f /etc/arch-release ]; then
-          pacman -S --noconfirm ufw
-        else
-          echo "Unsupported Linux distribution. Please install UFW manually."
-        fi
+        $PM_INSTALL ufw >/dev/null 2>&1
       fi
       configure_ufw
       break
@@ -125,22 +187,17 @@ while true; do
 done
 
 # Check if systemctl is available
-if ! command -v systemctl &> /dev/null; then
+if ! command -v systemctl &>/dev/null; then
   echo "Systemctl is not available on this system. Exiting."
   exit 1
 fi
 
-# Prompt the user to disable CUPS services
+# Prompt the user to remove CUPS services
 while true; do
-  read -p "Do you want to disable the printer services (CUPS) to improve security? (yes/no): " answer
+  read -p "Do you want to remove all printer services (CUPS) to improve security? (yes/no): " answer
   case $answer in
     [Yy]*)
-      # Disable CUPS services using systemctl
-      systemctl stop cups.service 2>&1 /dev/null
-      systemctl disable cups.service 2>&1 /dev/null
-      systemctl stop cups-browsed.service 2>&1 /dev/null
-      systemctl disable cups-browsed.service 2>&1 /dev/null
-      echo "CUPS services have been disabled."
+      remove_cups_packages
       break
       ;;
     [Nn]*)
@@ -158,10 +215,7 @@ while true; do
   read -p "Do you want to disable Bluetooth services to improve security? (yes/no): " answer
   case $answer in
     [Yy]*)
-      # Disable Bluetooth services using systemctl
-      systemctl stop bluetooth.service 2>&1 /dev/null
-      systemctl disable bluetooth.service 2>&1 /dev/null
-      echo "Bluetooth services have been disabled."
+      disable_bluetooth
       break
       ;;
     [Nn]*)
@@ -173,4 +227,5 @@ while true; do
       ;;
   esac
 done
-echo "System hardening completed. You should also remove all your unused packages, clean logs, and update your system. If you want, there is a script for doing this automatically on my GitHub."
+
+echo "System hardening completed. Consider removing unused packages, cleaning logs, and updating your system."
